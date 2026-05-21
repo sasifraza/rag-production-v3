@@ -1,0 +1,129 @@
+name: CI/CD — Build & Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+
+env:
+  ACR_URL: ragv2acr.azurecr.io
+  IMAGE: ragv2acr.azurecr.io/rag-production-v2
+  RESOURCE_GROUP: rag-production-v2-rg
+  CONTAINER_APP: rag-v2-app
+  CONTAINER_ENV: rag-v2-env
+  LOCATION: eastus
+  SUBSCRIPTION: 903e7f42-b475-4585-a0b5-6d4453deb671
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Freeze dependencies
+        run: |
+          pip install -r requirements.txt --quiet
+          pip freeze > requirements.txt
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Provision infrastructure
+        run: |
+          az group create \
+            --name $RESOURCE_GROUP \
+            --location $LOCATION \
+            --subscription $SUBSCRIPTION
+
+          az acr update \
+            --name ragv2acr \
+            --admin-enabled true \
+            --subscription $SUBSCRIPTION
+
+          az containerapp env create \
+            --name $CONTAINER_ENV \
+            --resource-group $RESOURCE_GROUP \
+            --location $LOCATION \
+            --subscription $SUBSCRIPTION \
+            2>/dev/null || true
+
+      - name: Docker login to ACR
+        run: |
+          docker login $ACR_URL \
+            --username ${{ secrets.ACR_USERNAME }} \
+            --password ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push image
+        run: |
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest .
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+      - name: Deploy to Container Apps
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+        run: |
+          if az containerapp show \
+              --name $CONTAINER_APP \
+              --resource-group $RESOURCE_GROUP \
+              --subscription $SUBSCRIPTION \
+              --output none 2>/dev/null; then
+            az containerapp update \
+              --name $CONTAINER_APP \
+              --resource-group $RESOURCE_GROUP \
+              --image $IMAGE:${{ github.sha }} \
+              --min-replicas 1 \
+              --set-env-vars \
+                OPENAI_API_KEY="$OPENAI_API_KEY" \
+                ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+                LANGSMITH_API_KEY="$LANGSMITH_API_KEY" \
+                LANGSMITH_TRACING=true \
+                LANGSMITH_PROJECT=rag-production-v2 \
+              --subscription $SUBSCRIPTION
+          else
+            az containerapp create \
+              --name $CONTAINER_APP \
+              --resource-group $RESOURCE_GROUP \
+              --environment $CONTAINER_ENV \
+              --image $IMAGE:${{ github.sha }} \
+              --target-port 8000 \
+              --ingress external \
+              --min-replicas 1 \
+              --registry-server $ACR_URL \
+              --registry-username ${{ secrets.ACR_USERNAME }} \
+              --registry-password ${{ secrets.ACR_PASSWORD }} \
+              --env-vars \
+                OPENAI_API_KEY="$OPENAI_API_KEY" \
+                ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+                LANGSMITH_API_KEY="$LANGSMITH_API_KEY" \
+                LANGSMITH_TRACING=true \
+                LANGSMITH_PROJECT=rag-production-v2 \
+              --subscription $SUBSCRIPTION
+          fi
+
+      - name: Route all traffic to latest revision
+        run: |
+          az containerapp ingress traffic set \
+            --name $CONTAINER_APP \
+            --resource-group $RESOURCE_GROUP \
+            --revision-weight latest=100 \
+            --subscription $SUBSCRIPTION
+
+      - name: Print app URL
+        run: |
+          az containerapp show \
+            --name $CONTAINER_APP \
+            --resource-group $RESOURCE_GROUP \
+            --subscription $SUBSCRIPTION \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv
