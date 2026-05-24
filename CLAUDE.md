@@ -1,67 +1,122 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+# CLAUDE.md — RAG Production v3
+# Last updated: May 2026
 
 ## Project Overview
+Production RAG API — FastAPI + LangGraph + ChromaDB + Anthropic Claude.
+Supports PDF ingestion, vector search, cross-encoder reranking, 
+multi-session conversation memory, LangSmith observability.
 
-Production RAG (Retrieval-Augmented Generation) API built with FastAPI and LangGraph. Supports document ingestion (PDF), vector search with Chroma, cross-encoder reranking, and multi-session conversation memory.
-
-## Setup & Running
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run locally (requires .env with keys set)
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# Docker
-docker build -t rag-production-v2 .
-docker run -p 8000:8000 --env-file .env rag-production-v2
-```
-
-Required environment variables (in `.env`):
-- `OPENAI_API_KEY` — used for HuggingFace embeddings (ingest/retrieval pipeline)
-- `ANTHROPIC_API_KEY` — used for generation (Sonnet) and grading/rewriting (Haiku)
-- `LANGSMITH_API_KEY`, `LANGSMITH_TRACING`, `LANGSMITH_PROJECT` — optional LLM observability
+## Stack
+- LLM: Anthropic Claude — Haiku (grading/rewriting) + Sonnet (generation)
+- Embeddings: HuggingFace all-MiniLM-L6-v2 via langchain_huggingface (free, downloads on first use)
+- Vector DB: ChromaDB at data/chroma/ (must exist before running locally)
+- Reranker: BAAI/bge-reranker-base, top-5 retrieve → top-3 rerank
+- Framework: LangGraph + LangChain + FastAPI
+- Observability: LangSmith (@traceable on every node)
 
 ## Architecture
 
 ### Request Flow
+POST /query → app/main.py → rag/graph.py (LangGraph) → retrieve → 
+grade_documents → generate (or rewrite → retrieve again) → quality_check
+POST /upload → app/main.py → rag/ingest.py → chunk → embed → Chroma
 
-```
-POST /query → app/main.py → rag/graph.py run_query() → retrieve → grade_documents → generate → quality_check
-                                                                              ↓ (no relevant docs)
-                                                                           rewrite → retrieve (max 2x)
-                                                                              ↓ (max rewrites hit)
-                                                                            no_docs → END
-POST /upload → app/main.py → rag/ingest.py → chunk → embed → Chroma (data/chroma/)
-```
+### LangGraph Nodes (graph.py)
+- retrieve: calls retriever.retrieve_and_rerank(query)
+- grade_documents: Haiku grades each doc yes/no, filters irrelevant
+- generate: Sonnet answers using filtered docs + last 4 messages history
+- rewrite: Haiku rewrites query if no relevant docs (max 2 retries)
+- no_docs: fallback message if max rewrites hit
+- quality_check: retry if answer under 20 chars
 
-### Key Modules
+### RAGState TypedDict
+query, context, answer, chat_history, documents, relevance, rewrite_count
 
-- **`app/main.py`** — FastAPI app with four endpoints: `GET /health`, `POST /upload`, `POST /query`, `GET /metrics`. Holds the in-memory `conversation_store` dict (keyed by `session_id`).
-- **`rag/graph.py`** — LangGraph `StateGraph` with 5 nodes: `retrieve`, `grade_documents`, `generate`, `rewrite`, `no_docs`. Uses Haiku (`claude-haiku-4-5-20251001`) for per-document relevance grading and query rewriting, Sonnet (`claude-sonnet-4-20250514`) for final generation. `quality_check` is a conditional edge (not a node) that retries retrieval if the answer is under 20 chars. `rewrite` is capped at `MAX_REWRITES = 2`; exceeding it routes to `no_docs`. Entry point for callers is `run_query(query, session_id, chat_history) → {answer, sources, chat_history}`. All 5 nodes are decorated with `@traceable` for LangSmith. `RAGState` carries: `query`, `context`, `answer`, `chat_history`, `rewrite_count`, `sources`.
-- **`rag/retriever.py`** — Wraps Chroma with HuggingFace embeddings (`all-MiniLM-L6-v2`). Retrieves top-5 by vector similarity (`TOP_K_RETRIEVE = 5`), reranks to top-3 using cross-encoder (`TOP_K_FINAL = 3`, `RERANK_MODEL = "BAAI/bge-reranker-base"`). Chroma path set via `CHROMA_PERSIST_DIR = "data/chroma/"`. Both models are downloaded on first use. Exposes `retrieve_and_rerank(query) -> list[Document]` using a module-level lazy-initialized retriever instance (loaded once per process).
-- **`rag/ingest.py`** — Loads PDFs with `PyPDFLoader`, splits with `RecursiveCharacterTextSplitter` (chunk_size=500, overlap=50), stores embeddings in Chroma at `data/chroma/`.
+## Key Modules
+- app/main.py — FastAPI, 4 endpoints, in-memory conversation_store 
+  (keyed by session_id, LOST ON RESTART)
+- rag/graph.py — LangGraph StateGraph, Anthropic Claude calls
+- rag/retriever.py — ChromaDB + HuggingFace + cross-encoder reranking
+- rag/ingest.py — PyPDFLoader, chunk_size=500, overlap=50, saves to data/chroma/
 
-### State & Memory
-
-- Conversation history lives in `conversation_store` in `app/main.py` — it is **in-memory only** and lost on restart.
-- The LangGraph state (`RAGState`) carries: `query`, `context`, `answer`, `chat_history`, `rewrite_count`, `sources`.
-- `chat_history` uses `Annotated[List, operator.add]` — LangGraph appends the two messages returned by `generate` automatically; callers must not manually concatenate.
-- Only the last 4 messages from history are passed to the generation prompt.
-
-### Storage
-
-- Chroma vector DB persists to `data/chroma/` (created by Docker; must exist locally before running).
-- No other database is used.
+## Retriever Config (retriever.py)
+CHROMA_PERSIST_DIR = "data/chroma/"
+COLLECTION_NAME    = "rag_v3_docs"
+EMBED_MODEL        = "sentence-transformers/all-MiniLM-L6-v2"
+RERANK_MODEL       = "BAAI/bge-reranker-base"
+TOP_K_RETRIEVE     = 5
+TOP_K_FINAL        = 3
 
 ## API Endpoints
+| Method | Path     | Purpose                                              |
+|--------|----------|------------------------------------------------------|
+| GET    | /health  | Returns status and version                           |
+| POST   | /upload  | Accepts PDF, ingests into Chroma                     |
+| POST   | /query   | {"query": "...", "session_id": "..."} → answer       |
+| GET    | /metrics | Active session count and feature list                |
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | Returns status and version |
-| POST | `/upload` | Accepts PDF file, ingests into Chroma |
-| POST | `/query` | Accepts `{"query": "...", "session_id": "..."}`, returns answer |
-| GET | `/metrics` | Returns active session count and feature list |
+## Environment Variables (.env)
+ANTHROPIC_API_KEY   — Claude Haiku + Sonnet
+LANGSMITH_API_KEY   — LangSmith observability
+LANGSMITH_TRACING   — true
+LANGSMITH_PROJECT   — rag-v3-langgraph
+
+## Local Development
+pip install -r requirements.txt
+mkdir -p data/chroma
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+## Deployment Architecture
+- Mac is Apple Silicon (ARM) — MUST build with --platform linux/amd64
+- Azure Container Apps runs linux/amd64 — ARM image fails silently
+- Docker built LOCALLY then pushed to ACR
+- GitHub Actions (.github/workflows/) ONLY runs az containerapp update (no Docker build in CI)
+
+### Local Build & Push
+bash scripts/build_and_push.sh
+
+### build_and_push.sh does:
+1. docker buildx build --platform linux/amd64 -t ragv3acr.azurecr.io/rag-production-v3:latest .
+2. az acr update --admin-enabled true --name ragv3acr
+3. docker login ragv3acr.azurecr.io (with ACR admin creds)
+4. docker push ragv3acr.azurecr.io/rag-production-v3:latest
+
+### Azure Resources
+- Subscription: 903e7f42-b475-4585-a0b5-6d4453deb671
+- Resource Group: rag-production-v3-rg
+- ACR: ragv3acr (ragv3acr.azurecr.io)
+- Container App: rag-v3-app
+- Region: eastus
+
+### Azure Deployment Rules (NEVER SKIP)
+- Always: az acr update --admin-enabled true
+- Always: --min-replicas 1
+- Always: --revision-weight latest=100
+- Always: docker login NOT az acr login
+- Always: --platform linux/amd64 on Mac
+
+### GitHub Secrets Required
+- AZURE_CREDENTIALS — full JSON from az ad sp create-for-rbac --sdk-auth
+- ACR_USERNAME      — ragv3acr
+- ACR_PASSWORD      — from az acr credential show --name ragv3acr
+- ANTHROPIC_API_KEY
+- LANGSMITH_API_KEY
+
+## Known Errors & Fixes
+1. click==8.1.8 conflict in requirements.txt
+   FIX: Remove all version pins, keep only direct dependencies unpinned
+
+2. azure/login@v2 fails — "client-id and tenant-id not supplied"
+   FIX: Always use azure/login@v1 with creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+3. Docker build on GitHub Actions too expensive
+   FIX: Build locally, push to ACR, CI only runs az containerapp update
+
+4. ARM/AMD64 mismatch — Mac builds arm64, Azure needs amd64
+   FIX: Always docker buildx build --platform linux/amd64
+
+5. Host key verification failed for GitHub SSH
+   FIX: ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+6. Chroma data/chroma/ directory missing locally
+   FIX: mkdir -p data/chroma before first run
